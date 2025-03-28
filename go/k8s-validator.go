@@ -50,8 +50,8 @@ type ValidationRule struct {
 
 // LabelRule defines the structure for label rules
 type LabelRule struct {
-    Required bool   `yaml:"required"`
-    Value    string `yaml:"value"`
+    Required      bool     `yaml:"required"`
+    AllowedValues []string `yaml:"allowed_values"`
 }
 
 // AnnotationRule defines the structure for annotation rules
@@ -213,13 +213,35 @@ func (v *Validator) checkLabelsAnnotations() {
                 Fix:     fmt.Sprintf("metadata:\n  labels:\n    %s: <value>  # Add the required label", key),
             })
         }
-        if rule.Value != "" && actual != rule.Value {
-            v.Warnings = append(v.Warnings, ValidationIssue{
-                Type:    "Warning",
-                Message: fmt.Sprintf("Label '%s' must be '%s', got '%v'", key, rule.Value, actual),
-                Reason:  fmt.Sprintf("The label '%s' must have the value '%s' to meet organizational standards.", key, rule.Value),
-                Fix:     fmt.Sprintf("metadata:\n  labels:\n    %s: %s  # Set the correct value", key, rule.Value),
-            })
+        // Check if the actual value is in the allowed values
+        if len(rule.AllowedValues) > 0 {
+            actualStr, ok := actual.(string)
+            if !ok && exists {
+                v.Warnings = append(v.Warnings, ValidationIssue{
+                    Type:    "Warning",
+                    Message: fmt.Sprintf("Label '%s' must be a string, got '%v'", key, actual),
+                    Reason:  fmt.Sprintf("The label '%s' must be a string value.", key),
+                    Fix:     fmt.Sprintf("metadata:\n  labels:\n    %s: %s  # Set a valid string value", key, rule.AllowedValues[0]),
+                })
+                continue
+            }
+            if exists {
+                found := false
+                for _, allowed := range rule.AllowedValues {
+                    if actualStr == allowed {
+                        found = true
+                        break
+                    }
+                }
+                if !found {
+                    v.Warnings = append(v.Warnings, ValidationIssue{
+                        Type:    "Warning",
+                        Message: fmt.Sprintf("Label '%s' must be one of %v, got '%s'", key, rule.AllowedValues, actualStr),
+                        Reason:  fmt.Sprintf("The label '%s' must have one of the allowed values %v to meet organizational standards.", key, rule.AllowedValues),
+                        Fix:     fmt.Sprintf("metadata:\n  labels:\n    %s: %s  # Set a valid value", key, rule.AllowedValues[0]),
+                    })
+                }
+            }
         }
     }
 
@@ -760,6 +782,55 @@ type model struct {
     quit         bool
 }
 
+// Styles for the UI
+var (
+    headerStyle = lipgloss.NewStyle().
+        Bold(true).
+        Foreground(lipgloss.Color("205")). // Purple
+        Padding(0, 1)
+
+    errorTypeStyle = lipgloss.NewStyle().
+        Background(lipgloss.Color("9")). // Red
+        Foreground(lipgloss.Color("0")). // Black
+        Padding(0, 1)
+
+    warningTypeStyle = lipgloss.NewStyle().
+        Background(lipgloss.Color("11")). // Yellow
+        Foreground(lipgloss.Color("0")).  // Black
+        Padding(0, 1)
+
+    messageStyle = lipgloss.NewStyle().
+        Bold(true).
+        Foreground(lipgloss.Color("15")) // White
+
+    reasonStyle = lipgloss.NewStyle().
+        Foreground(lipgloss.Color("245")). // Light gray
+        Width(80).
+        Align(lipgloss.Left)
+
+    fixStyle = lipgloss.NewStyle().
+        Background(lipgloss.Color("236")). // Dark gray
+        Foreground(lipgloss.Color("10")).  // Green
+        Padding(1).
+        MarginTop(1).
+        Width(80)
+
+    progressStyle = lipgloss.NewStyle().
+        Foreground(lipgloss.Color("205")). // Purple
+        Width(50)
+
+    navStyle = lipgloss.NewStyle().
+        Foreground(lipgloss.Color("240")). // Gray
+        Italic(true).
+        MarginTop(1)
+
+    containerStyle = lipgloss.NewStyle().
+        Border(lipgloss.RoundedBorder()).
+        BorderForeground(lipgloss.Color("205")). // Purple
+        Padding(1).
+        Margin(1)
+)
+
 func (m model) Init() tea.Cmd {
     return nil
 }
@@ -786,28 +857,69 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) View() string {
     if m.quit {
-        return "Validation complete. Goodbye!\n"
+        return lipgloss.NewStyle().
+            Foreground(lipgloss.Color("42")).
+            Render("Validation complete. Goodbye!\n")
     }
 
     if len(m.issues) == 0 {
-        return lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Render("✓ Manifest looks good!\n")
+        return lipgloss.NewStyle().
+            Foreground(lipgloss.Color("42")).
+            Render("✓ Manifest looks good!\n")
     }
-
-    var s strings.Builder
-    s.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("9")).Render(fmt.Sprintf("Validation Issues (%d/%d):\n", m.currentIndex+1, len(m.issues))))
 
     issue := m.issues[m.currentIndex]
-    style := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+
+    // Header
+    header := headerStyle.Render(fmt.Sprintf("Validation Issues (%d/%d)", m.currentIndex+1, len(m.issues)))
+
+    // Type and Message
+    typeStyle := errorTypeStyle
     if issue.Type == "Warning" {
-        style = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
+        typeStyle = warningTypeStyle
     }
+    typeLabel := typeStyle.Render(issue.Type)
+    message := messageStyle.Render(issue.Message)
+    typeMessage := lipgloss.JoinHorizontal(lipgloss.Left, typeLabel, " ", message)
 
-    s.WriteString(style.Render(fmt.Sprintf("%s: %s\n", issue.Type, issue.Message)))
-    s.WriteString(lipgloss.NewStyle().Render(fmt.Sprintf("Reason: %s\n", issue.Reason)))
-    s.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render(fmt.Sprintf("Fix:\n%s\n", issue.Fix)))
+    // Reason
+    reason := reasonStyle.Render("Reason: " + issue.Reason)
 
-    s.WriteString("\nUse ↑/↓ or k/j to navigate, q to quit.\n")
-    return s.String()
+    // Fix (with proper indentation)
+    fixLines := strings.Split(issue.Fix, "\n")
+    indentedFix := strings.Join(fixLines, "\n")
+    fix := fixStyle.Render(indentedFix)
+
+    // Progress Bar
+    total := len(m.issues)
+    current := m.currentIndex + 1
+    progress := progressStyle.Render(progressBar(50, current, total))
+
+    // Navigation Instructions
+    nav := navStyle.Render("Use ↑/↓ or k/j to navigate, q to quit.")
+
+    // Combine all parts into a container
+    content := lipgloss.JoinVertical(
+        lipgloss.Left,
+        header,
+        typeMessage,
+        reason,
+        fix,
+        progress,
+        nav,
+    )
+
+    return containerStyle.Render(content)
+}
+
+// progressBar generates a simple progress bar
+func progressBar(width, current, total int) string {
+    if total == 0 {
+        return ""
+    }
+    filled := int(float64(width) * float64(current) / float64(total))
+    empty := width - filled
+    return "[" + strings.Repeat("█", filled) + strings.Repeat(" ", empty) + "]"
 }
 
 func validateManifest(manifestPath, manifestDir string) error {
