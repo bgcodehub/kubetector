@@ -1,0 +1,107 @@
+# Required fields by resource kind
+required_fields:
+  deployment:
+    - apiVersion
+    - kind
+    - metadata
+    - spec
+    - spec.replicas
+    - spec.template.spec.containers
+  service:
+    - apiVersion
+    - kind
+    - metadata
+    - spec
+
+# Namespace rules
+namespace:
+  required: true
+  allowed:
+    - production
+    - staging
+
+# Label requirements
+labels:
+  app:
+    required: true
+  environment:
+    required: true
+    value: "production"
+  team:
+    required: true
+    value: "devops"
+
+# Annotation requirements
+annotations:
+  owner:
+    required: true
+    value: "devops-team"
+  monitored:
+    required: true
+    value: "true"
+
+# Resource requirements
+resources:
+  requests:
+    memory:
+      required: true
+      min: "256Mi"
+    cpu:
+      required: true
+      min: "100m"
+  limits:
+    memory:
+      required: true
+      max: "1Gi"
+    cpu:
+      required: true
+      max: "500m"
+
+# Security context rules
+security:
+  pod:
+    runAsNonRoot:
+      required: true
+      value: true
+    fsGroup:
+      required: false
+      value: 1000
+  container:
+    privileged:
+      required: true
+      value: false
+    readOnlyRootFilesystem:
+      required: true
+      value: true
+
+# Service relationship
+require_service: true
+
+# Image policies
+images:
+  registry: "myregistry.com/"
+  no_latest: true
+  allowed:
+    - "myregistry.com/app:1.0.0"
+    - "myregistry.com/db:2.3.1"
+
+# Networking rules
+networking:
+  ports_required: true
+  allowed_ports:
+    - 80
+    - 443
+    - 8080
+
+# Probe requirements
+probes:
+  liveness_required: true
+  readiness_required: true
+
+# Volume rules
+volumes:
+  required: false
+  allowed_types:
+    - persistentVolumeClaim
+    - configMap
+    - secret
