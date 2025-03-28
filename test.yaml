@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-deployment
+  namespace: development
+  labels:
+    app: test-app
+    environment: development
+    team: devops
+  annotations:
+    owner: "devops-team"
+    monitored: "true"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: test-app
+  template:
+    metadata:
+      labels:
+        app: test-app
+    spec:
+      containers:
+      - name: app-container
+        image: nginx:latest
+        ports:
+        - containerPort: 8081
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "50m"
+          limits:
+            memory: "2Gi"
+            cpu: "600m"
+        securityContext:
+          privileged: true
+          readOnlyRootFilesystem: true
+      securityContext:
+        runAsNonRoot: true
+      volumes:
+      - name: test-volume
+        emptyDir: {}

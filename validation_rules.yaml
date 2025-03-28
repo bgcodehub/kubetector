@@ -16,9 +16,6 @@ required_fields:
 # Namespace rules
 namespace:
   required: true
-  allowed:
-    - production
-    - staging
 
 # Label requirements
 labels:
@@ -63,9 +60,6 @@ security:
     runAsNonRoot:
       required: true
       value: true
-    fsGroup:
-      required: false
-      value: 1000
   container:
     privileged:
       required: true
