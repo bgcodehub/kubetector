@@ -1,67 +1,76 @@
 package main
 
 import (
-    "fmt"
-    "os"
-    "path/filepath"
-    "strings"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 
-    tea "github.com/charmbracelet/bubbletea"
-    "github.com/charmbracelet/lipgloss"
-    "github.com/spf13/cobra"
-    "gopkg.in/yaml.v3"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 )
 
 // ValidationRule defines the structure of the validation rules in validation_rules.yaml
 type ValidationRule struct {
-    RequiredFields map[string][]string            `yaml:"required_fields"`
-    Namespace      struct{ Required bool }        `yaml:"namespace"`
-    Labels         map[string]struct {            `yaml:"labels"`
-        Required bool   `yaml:"required"`
-        Value    string `yaml:"value"`
-    }
-    Annotations map[string]struct {            `yaml:"annotations"`
-        Required bool   `yaml:"required"`
-        Value    string `yaml:"value"`
-    }
-    Resources struct { `yaml:"resources"`
-        Requests map[string]struct { `yaml:"requests"`
-            Required bool   `yaml:"required"`
-            Min      string `yaml:"min"`
-        }
-        Limits map[string]struct { `yaml:"limits"`
-            Required bool   `yaml:"required"`
-            Max      string `yaml:"max"`
-        }
-    }
-    Security struct { `yaml:"security"`
-        Pod      map[string]struct { `yaml:"pod"`
-            Required bool        `yaml:"required"`
-            Value    interface{} `yaml:"value"`
-        }
-        Container map[string]struct { `yaml:"container"`
-            Required bool        `yaml:"required"`
-            Value    interface{} `yaml:"value"`
-        }
-    }
+    RequiredFields map[string][]string `yaml:"required_fields"`
+    Namespace      struct {
+        Required bool `yaml:"required"`
+    } `yaml:"namespace"`
+    Labels map[string]LabelRule `yaml:"labels"`
+    Annotations map[string]AnnotationRule `yaml:"annotations"`
+    Resources struct {
+        Requests map[string]ResourceRule `yaml:"requests"`
+        Limits   map[string]ResourceRule `yaml:"limits"`
+    } `yaml:"resources"`
+    Security struct {
+        Pod      map[string]SecurityRule `yaml:"pod"`
+        Container map[string]SecurityRule `yaml:"container"`
+    } `yaml:"security"`
     RequireService bool `yaml:"require_service"`
-    Images         struct { `yaml:"images"`
+    Images         struct {
         Registry string   `yaml:"registry"`
         NoLatest bool     `yaml:"no_latest"`
         Allowed  []string `yaml:"allowed"`
-    }
-    Networking struct { `yaml:"networking"`
-        PortsRequired bool     `yaml:"ports_required"`
-        AllowedPorts  []int    `yaml:"allowed_ports"`
-    }
-    Probes struct { `yaml:"probes"`
+    } `yaml:"images"`
+    Networking struct {
+        PortsRequired bool   `yaml:"ports_required"`
+        AllowedPorts  []int  `yaml:"allowed_ports"`
+    } `yaml:"networking"`
+    Probes struct {
         LivenessRequired  bool `yaml:"liveness_required"`
         ReadinessRequired bool `yaml:"readiness_required"`
-    }
-    Volumes struct { `yaml:"volumes"`
+    } `yaml:"probes"`
+    Volumes struct {
         Required     bool     `yaml:"required"`
         AllowedTypes []string `yaml:"allowed_types"`
-    }
+    } `yaml:"volumes"`
+}
+
+// LabelRule defines the structure for label rules
+type LabelRule struct {
+    Required bool   `yaml:"required"`
+    Value    string `yaml:"value"`
+}
+
+// AnnotationRule defines the structure for annotation rules
+type AnnotationRule struct {
+    Required bool   `yaml:"required"`
+    Value    string `yaml:"value"`
+}
+
+// ResourceRule defines the structure for resource rules
+type ResourceRule struct {
+    Required bool   `yaml:"required"`
+    Min      string `yaml:"min,omitempty"`
+    Max      string `yaml:"max,omitempty"`
+}
+
+// SecurityRule defines the structure for security rules
+type SecurityRule struct {
+    Required bool        `yaml:"required"`
+    Value    interface{} `yaml:"value"`
 }
 
 // ValidationIssue represents an error or warning with a message, reason, and fix
@@ -153,7 +162,10 @@ func (v *Validator) checkRequiredFields() {
 }
 
 func (v *Validator) checkNamespace() {
-    metadata, _ := v.Manifest["metadata"].(map[string]interface{})
+    metadata, ok := v.Manifest["metadata"].(map[string]interface{})
+    if !ok {
+        metadata = make(map[string]interface{})
+    }
     actualNs, _ := metadata["namespace"].(string)
     if actualNs == "" {
         actualNs = "default"
@@ -178,9 +190,18 @@ func (v *Validator) checkNamespace() {
 }
 
 func (v *Validator) checkLabelsAnnotations() {
-    metadata, _ := v.Manifest["metadata"].(map[string]interface{})
-    labels, _ := metadata["labels"].(map[string]interface{})
-    annotations, _ := metadata["annotations"].(map[string]interface{})
+    metadata, ok := v.Manifest["metadata"].(map[string]interface{})
+    if !ok {
+        metadata = make(map[string]interface{})
+    }
+    labels, ok := metadata["labels"].(map[string]interface{})
+    if !ok {
+        labels = make(map[string]interface{})
+    }
+    annotations, ok := metadata["annotations"].(map[string]interface{})
+    if !ok {
+        annotations = make(map[string]interface{})
+    }
 
     for key, rule := range v.Rules.Labels {
         actual, exists := labels[key]
@@ -228,23 +249,53 @@ func (v *Validator) checkResourceLimits() {
         return
     }
 
-    spec, _ := v.Manifest["spec"].(map[string]interface{})
-    template, _ := spec["template"].(map[string]interface{})
-    podSpec, _ := template["spec"].(map[string]interface{})
-    containers, _ := podSpec["containers"].([]interface{})
+    spec, ok := v.Manifest["spec"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    template, ok := spec["template"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    podSpec, ok := template["spec"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    containers, ok := podSpec["containers"].([]interface{})
+    if !ok {
+        return
+    }
 
     for _, container := range containers {
-        cont, _ := container.(map[string]interface{})
+        cont, ok := container.(map[string]interface{})
+        if !ok {
+            continue
+        }
         name, _ := cont["name"].(string)
         if name == "" {
             name = "unnamed"
         }
-        resources, _ := cont["resources"].(map[string]interface{})
-        requests, _ := resources["requests"].(map[string]interface{})
-        limits, _ := resources["limits"].(map[string]interface{})
+        resources, ok := cont["resources"].(map[string]interface{})
+        if !ok {
+            resources = make(map[string]interface{})
+        }
+        requests, ok := resources["requests"].(map[string]interface{})
+        if !ok {
+            requests = make(map[string]interface{})
+        }
+        limits, ok := resources["limits"].(map[string]interface{})
+        if !ok {
+            limits = make(map[string]interface{})
+        }
 
         for res, rule := range v.Rules.Resources.Requests {
-            actual := parseResourceValue(requests[res].(string))
+            actualVal, exists := requests[res]
+            actual := parseResourceValue("")
+            if exists {
+                if strVal, ok := actualVal.(string); ok {
+                    actual = parseResourceValue(strVal)
+                }
+            }
             if rule.Min != "" && actual.LessThan(parseResourceValue(rule.Min)) {
                 v.Warnings = append(v.Warnings, ValidationIssue{
                     Type:    "Warning",
@@ -253,7 +304,7 @@ func (v *Validator) checkResourceLimits() {
                     Fix:     fmt.Sprintf("spec:\n  template:\n    spec:\n      containers:\n      - name: %s\n        resources:\n          requests:\n            %s: %s  # Increase to at least the minimum", name, res, rule.Min),
                 })
             }
-            if rule.Required && requests[res] == nil {
+            if rule.Required && !exists {
                 v.Warnings = append(v.Warnings, ValidationIssue{
                     Type:    "Warning",
                     Message: fmt.Sprintf("Container '%s' missing %s request", name, res),
@@ -264,7 +315,13 @@ func (v *Validator) checkResourceLimits() {
         }
 
         for res, rule := range v.Rules.Resources.Limits {
-            actual := parseResourceValue(limits[res].(string))
+            actualVal, exists := limits[res]
+            actual := parseResourceValue("")
+            if exists {
+                if strVal, ok := actualVal.(string); ok {
+                    actual = parseResourceValue(strVal)
+                }
+            }
             if rule.Max != "" && actual.GreaterThan(parseResourceValue(rule.Max)) {
                 v.Warnings = append(v.Warnings, ValidationIssue{
                     Type:    "Warning",
@@ -273,7 +330,7 @@ func (v *Validator) checkResourceLimits() {
                     Fix:     fmt.Sprintf("spec:\n  template:\n    spec:\n      containers:\n      - name: %s\n        resources:\n          limits:\n            %s: %s  # Decrease to at most the maximum", name, res, rule.Max),
                 })
             }
-            if rule.Required && limits[res] == nil {
+            if rule.Required && !exists {
                 v.Warnings = append(v.Warnings, ValidationIssue{
                     Type:    "Warning",
                     Message: fmt.Sprintf("Container '%s' missing %s limit", name, res),
@@ -290,11 +347,26 @@ func (v *Validator) checkSecurityContext() {
         return
     }
 
-    spec, _ := v.Manifest["spec"].(map[string]interface{})
-    template, _ := spec["template"].(map[string]interface{})
-    podSpec, _ := template["spec"].(map[string]interface{})
-    containers, _ := podSpec["containers"].([]interface{})
-    podSC, _ := podSpec["securityContext"].(map[string]interface{})
+    spec, ok := v.Manifest["spec"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    template, ok := spec["template"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    podSpec, ok := template["spec"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    containers, ok := podSpec["containers"].([]interface{})
+    if !ok {
+        return
+    }
+    podSC, ok := podSpec["securityContext"].(map[string]interface{})
+    if !ok {
+        podSC = make(map[string]interface{})
+    }
 
     for key, rule := range v.Rules.Security.Pod {
         actual := podSC[key]
@@ -317,12 +389,18 @@ func (v *Validator) checkSecurityContext() {
     }
 
     for _, container := range containers {
-        cont, _ := container.(map[string]interface{})
+        cont, ok := container.(map[string]interface{})
+        if !ok {
+            continue
+        }
         name, _ := cont["name"].(string)
         if name == "" {
             name = "unnamed"
         }
-        contSC, _ := cont["securityContext"].(map[string]interface{})
+        contSC, ok := cont["securityContext"].(map[string]interface{})
+        if !ok {
+            contSC = make(map[string]interface{})
+        }
 
         for key, rule := range v.Rules.Security.Container {
             actual := contSC[key]
@@ -351,15 +429,30 @@ func (v *Validator) checkServiceRelationship(allManifests []map[string]interface
         return
     }
 
-    spec, _ := v.Manifest["spec"].(map[string]interface{})
-    selector, _ := spec["selector"].(map[string]interface{})
-    matchLabels, _ := selector["matchLabels"].(map[string]interface{})
+    spec, ok := v.Manifest["spec"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    selector, ok := spec["selector"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    matchLabels, ok := selector["matchLabels"].(map[string]interface{})
+    if !ok {
+        return
+    }
 
     serviceFound := false
     for _, other := range allManifests {
-        if otherKind, _ := other["kind"].(string); strings.ToLower(otherKind) == "service" {
-            otherSpec, _ := other["spec"].(map[string]interface{})
-            svcSelector, _ := otherSpec["selector"].(map[string]interface{})
+        if otherKind, ok := other["kind"].(string); ok && strings.ToLower(otherKind) == "service" {
+            otherSpec, ok := other["spec"].(map[string]interface{})
+            if !ok {
+                continue
+            }
+            svcSelector, ok := otherSpec["selector"].(map[string]interface{})
+            if !ok {
+                continue
+            }
             if fmt.Sprintf("%v", svcSelector) == fmt.Sprintf("%v", matchLabels) {
                 serviceFound = true
                 break
@@ -368,11 +461,27 @@ func (v *Validator) checkServiceRelationship(allManifests []map[string]interface
     }
 
     if !serviceFound {
+        // Marshal matchLabels to YAML
+        labelsYAML, err := yaml.Marshal(matchLabels)
+        if err != nil {
+            // If marshaling fails, provide a fallback message
+            v.Warnings = append(v.Warnings, ValidationIssue{
+                Type:    "Warning",
+                Message: "Deployment missing corresponding Service with matching selector",
+                Reason:  "A Service is required to expose the Deployment's pods to the network.",
+                Fix:     "apiVersion: v1\nkind: Service\nmetadata:\n  name: <service-name>\nspec:\n  selector:\n    # Unable to marshal selector labels due to error\n  ports:\n  - protocol: TCP\n    port: 80\n    targetPort: 80  # Create a Service with matching selector",
+            })
+            return
+        }
+
+        // Convert the marshaled YAML (which is []byte) to a string
+        labelsYAMLStr := string(labelsYAML)
+
         v.Warnings = append(v.Warnings, ValidationIssue{
             Type:    "Warning",
             Message: "Deployment missing corresponding Service with matching selector",
             Reason:  "A Service is required to expose the Deployment's pods to the network.",
-            Fix:     fmt.Sprintf("apiVersion: v1\nkind: Service\nmetadata:\n  name: <service-name>\nspec:\n  selector:\n    %s\n  ports:\n  - protocol: TCP\n    port: 80\n    targetPort: 80  # Create a Service with matching selector", yaml.Marshal(matchLabels)),
+            Fix:     fmt.Sprintf("apiVersion: v1\nkind: Service\nmetadata:\n  name: <service-name>\nspec:\n  selector:\n    %s  ports:\n  - protocol: TCP\n    port: 80\n    targetPort: 80  # Create a Service with matching selector", labelsYAMLStr),
         })
     }
 }
@@ -382,18 +491,36 @@ func (v *Validator) checkImagePolicies() {
         return
     }
 
-    spec, _ := v.Manifest["spec"].(map[string]interface{})
-    template, _ := spec["template"].(map[string]interface{})
-    podSpec, _ := template["spec"].(map[string]interface{})
-    containers, _ := podSpec["containers"].([]interface{})
+    spec, ok := v.Manifest["spec"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    template, ok := spec["template"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    podSpec, ok := template["spec"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    containers, ok := podSpec["containers"].([]interface{})
+    if !ok {
+        return
+    }
 
     for _, container := range containers {
-        cont, _ := container.(map[string]interface{})
+        cont, ok := container.(map[string]interface{})
+        if !ok {
+            continue
+        }
         name, _ := cont["name"].(string)
         if name == "" {
             name = "unnamed"
         }
-        image, _ := cont["image"].(string)
+        image, ok := cont["image"].(string)
+        if !ok {
+            image = ""
+        }
 
         if v.Rules.Images.Registry != "" && !strings.HasPrefix(image, v.Rules.Images.Registry) {
             v.Errors = append(v.Errors, ValidationIssue{
@@ -436,18 +563,36 @@ func (v *Validator) checkNetworking() {
         return
     }
 
-    spec, _ := v.Manifest["spec"].(map[string]interface{})
-    template, _ := spec["template"].(map[string]interface{})
-    podSpec, _ := template["spec"].(map[string]interface{})
-    containers, _ := podSpec["containers"].([]interface{})
+    spec, ok := v.Manifest["spec"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    template, ok := spec["template"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    podSpec, ok := template["spec"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    containers, ok := podSpec["containers"].([]interface{})
+    if !ok {
+        return
+    }
 
     for _, container := range containers {
-        cont, _ := container.(map[string]interface{})
+        cont, ok := container.(map[string]interface{})
+        if !ok {
+            continue
+        }
         name, _ := cont["name"].(string)
         if name == "" {
             name = "unnamed"
         }
-        ports, _ := cont["ports"].([]interface{})
+        ports, ok := cont["ports"].([]interface{})
+        if !ok {
+            ports = []interface{}{}
+        }
 
         if v.Rules.Networking.PortsRequired && len(ports) == 0 {
             v.Warnings = append(v.Warnings, ValidationIssue{
@@ -458,8 +603,14 @@ func (v *Validator) checkNetworking() {
             })
         }
         for _, port := range ports {
-            p, _ := port.(map[string]interface{})
-            containerPort, _ := p["containerPort"].(int)
+            p, ok := port.(map[string]interface{})
+            if !ok {
+                continue
+            }
+            containerPort, ok := p["containerPort"].(int)
+            if !ok {
+                continue
+            }
             if len(v.Rules.Networking.AllowedPorts) > 0 {
                 allowed := false
                 for _, allowedPort := range v.Rules.Networking.AllowedPorts {
@@ -486,13 +637,28 @@ func (v *Validator) checkProbes() {
         return
     }
 
-    spec, _ := v.Manifest["spec"].(map[string]interface{})
-    template, _ := spec["template"].(map[string]interface{})
-    podSpec, _ := template["spec"].(map[string]interface{})
-    containers, _ := podSpec["containers"].([]interface{})
+    spec, ok := v.Manifest["spec"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    template, ok := spec["template"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    podSpec, ok := template["spec"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    containers, ok := podSpec["containers"].([]interface{})
+    if !ok {
+        return
+    }
 
     for _, container := range containers {
-        cont, _ := container.(map[string]interface{})
+        cont, ok := container.(map[string]interface{})
+        if !ok {
+            continue
+        }
         name, _ := cont["name"].(string)
         if name == "" {
             name = "unnamed"
@@ -524,10 +690,22 @@ func (v *Validator) checkVolumes() {
         return
     }
 
-    spec, _ := v.Manifest["spec"].(map[string]interface{})
-    template, _ := spec["template"].(map[string]interface{})
-    podSpec, _ := template["spec"].(map[string]interface{})
-    volumes, _ := podSpec["volumes"].([]interface{})
+    spec, ok := v.Manifest["spec"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    template, ok := spec["template"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    podSpec, ok := template["spec"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    volumes, ok := podSpec["volumes"].([]interface{})
+    if !ok {
+        volumes = []interface{}{}
+    }
 
     if v.Rules.Volumes.Required && len(volumes) == 0 {
         v.Warnings = append(v.Warnings, ValidationIssue{
@@ -539,7 +717,10 @@ func (v *Validator) checkVolumes() {
     }
 
     for _, volume := range volumes {
-        vol, _ := volume.(map[string]interface{})
+        vol, ok := volume.(map[string]interface{})
+        if !ok {
+            continue
+        }
         name, _ := vol["name"].(string)
         if name == "" {
             name = "unnamed"
@@ -674,9 +855,27 @@ func validateManifest(manifestPath, manifestDir string) error {
         return fmt.Errorf("error reading manifest: %v", err)
     }
 
-    var manifests []map[string]interface{}
-    if err := yaml.Unmarshal(data, &manifests); err != nil {
+    // First, unmarshal into a generic interface to determine the structure
+    var raw interface{}
+    if err := yaml.Unmarshal(data, &raw); err != nil {
         return fmt.Errorf("error parsing manifest: %v", err)
+    }
+
+    // Convert the raw data into a slice of manifests
+    var manifests []map[string]interface{}
+    switch v := raw.(type) {
+    case []interface{}:
+        // If the YAML contains multiple documents (a slice), convert each to a map
+        for _, doc := range v {
+            if m, ok := doc.(map[string]interface{}); ok {
+                manifests = append(manifests, m)
+            }
+        }
+    case map[string]interface{}:
+        // If the YAML contains a single document (a map), wrap it in a slice
+        manifests = append(manifests, v)
+    default:
+        return fmt.Errorf("error parsing manifest: unexpected YAML structure, got type %T", v)
     }
 
     for _, manifest := range manifests {
@@ -684,10 +883,15 @@ func validateManifest(manifestPath, manifestDir string) error {
             continue
         }
 
+        kind, ok := manifest["kind"].(string)
+        if !ok {
+            continue
+        }
+
         validator := &Validator{
             Rules:    rules,
             Manifest: manifest,
-            Kind:     strings.ToLower(manifest["kind"].(string)),
+            Kind:     strings.ToLower(kind),
         }
 
         // Run all validation checks
