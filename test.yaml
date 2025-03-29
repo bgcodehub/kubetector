@@ -5,11 +5,9 @@ metadata:
   namespace: development
   labels:
     app: test-app
-    environment: development
-    team: devops
+    owner: dev-team
   annotations:
-    owner: "devops-team"
-    monitored: "true"
+    owner: dev-team
 spec:
   replicas: 3
   selector:
@@ -40,3 +38,28 @@ spec:
       volumes:
       - name: test-volume
         emptyDir: {}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  labels:
+    app: test-app
+    owner: dev-team
+    prometheus-enabled: "true"
+    release: prometheus-operator
+  name: servicemonitor
+  namespace: default
+spec:
+  endpoints:
+  - interval: 30s
+    path: /prometheus
+    port: app-port
+    scheme: http
+  namespaceSelector:
+    matchNames:
+    - default
+  selector:
+    matchLabels:
+      app: go-api
+      owner: cfa
+---

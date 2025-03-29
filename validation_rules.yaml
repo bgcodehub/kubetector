@@ -12,6 +12,24 @@ required_fields:
     - kind
     - metadata
     - spec
+  poddisruptionbudget:
+    - apiVersion
+    - kind
+    - metadata
+    - spec
+  horizontalpodautoscaler:
+    - apiVersion
+    - kind
+    - metadata
+    - spec
+  servicemonitor:
+    - apiVersion
+    - kind
+    - metadata
+    - spec
+    - spec.endpoints
+    - spec.namespaceSelector
+    - spec.selector
 
 # Namespace rules
 namespace:
@@ -21,24 +39,13 @@ namespace:
 labels:
   app:
     required: true
-  environment:
+  owner:
     required: true
-    allowed_values:
-      - dev
-      - test
-      - prod
-  team:
-    required: true
-    value: "devops"
 
 # Annotation requirements
 annotations:
   owner:
     required: true
-    value: "devops-team"
-  monitored:
-    required: true
-    value: "true"
 
 # Resource requirements
 resources:
@@ -102,3 +109,7 @@ volumes:
     - persistentVolumeClaim
     - configMap
     - secret
+
+# ServiceMonitor requirements
+service_monitor:
+  required: true

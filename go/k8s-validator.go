@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,12 +48,16 @@ type ValidationRule struct {
         Required     bool     `yaml:"required"`
         AllowedTypes []string `yaml:"allowed_types"`
     } `yaml:"volumes"`
+    ServiceMonitor struct {
+        Required bool `yaml:"required"`
+    } `yaml:"service_monitor"`
 }
 
 // LabelRule defines the structure for label rules
 type LabelRule struct {
     Required      bool     `yaml:"required"`
     AllowedValues []string `yaml:"allowed_values"`
+    Value         string   `yaml:"value"` // Keep for backward compatibility
 }
 
 // AnnotationRule defines the structure for annotation rules
@@ -242,6 +248,14 @@ func (v *Validator) checkLabelsAnnotations() {
                     })
                 }
             }
+        } else if rule.Value != "" && actual != rule.Value {
+            // Fallback to single value check if allowed_values is not specified
+            v.Warnings = append(v.Warnings, ValidationIssue{
+                Type:    "Warning",
+                Message: fmt.Sprintf("Label '%s' must be '%s', got '%v'", key, rule.Value, actual),
+                Reason:  fmt.Sprintf("The label '%s' must have the value '%s' to meet organizational standards.", key, rule.Value),
+                Fix:     fmt.Sprintf("metadata:\n  labels:\n    %s: %s  # Set the correct value", key, rule.Value),
+            })
         }
     }
 
@@ -774,6 +788,462 @@ func (v *Validator) checkVolumes() {
     }
 }
 
+func (v *Validator) checkServiceMonitor(allManifests []map[string]interface{}) {
+    if !v.Rules.ServiceMonitor.Required {
+        return
+    }
+
+    serviceMonitorFound := false
+    for _, manifest := range allManifests {
+        if kind, ok := manifest["kind"].(string); ok && kind == "ServiceMonitor" {
+            apiVersion, ok := manifest["apiVersion"].(string)
+            if ok && apiVersion == "monitoring.coreos.com/v1" {
+                serviceMonitorFound = true
+                break
+            }
+        }
+    }
+
+    if !serviceMonitorFound {
+        v.Warnings = append(v.Warnings, ValidationIssue{
+            Type:    "Warning",
+            Message: "Missing required ServiceMonitor resource",
+            Reason:  "A ServiceMonitor is required to enable Prometheus monitoring for the application.",
+            Fix:     "apiVersion: monitoring.coreos.com/v1\nkind: ServiceMonitor\nmetadata:\n  labels:\n    app: <app-name>\n    owner: <owner-name>\n    prometheus-enabled: \"true\"\n    release: prometheus-operator\n  name: servicemonitor\n  namespace: <namespace>\nspec:\n  endpoints:\n  - interval: 30s\n    path: /prometheus\n    port: app-port\n    scheme: http\n  namespaceSelector:\n    matchNames:\n    - default\n  selector:\n    matchLabels:\n      app: <app-name>\n      owner: <owner-name>",
+        })
+        return
+    }
+}
+
+func (v *Validator) checkDeploymentReplicas() {
+    if v.Kind != "deployment" {
+        return
+    }
+
+    spec, ok := v.Manifest["spec"].(map[string]interface{})
+    if !ok {
+        return
+    }
+
+    replicas, ok := spec["replicas"].(int)
+    if !ok {
+        // If replicas is not an int, it might be a float64 due to YAML unmarshaling
+        if replicasFloat, ok := spec["replicas"].(float64); ok {
+            replicas = int(replicasFloat)
+        } else {
+            return
+        }
+    }
+
+    if replicas < 3 {
+        v.Warnings = append(v.Warnings, ValidationIssue{
+            Type:    "Warning",
+            Message: fmt.Sprintf("Deployment replicas should be at least 3, got %d", replicas),
+            Reason:  "Deployments should typically use 3 replicas to ensure high availability and facilitate scaling.",
+            Fix:     "spec:\n  replicas: 3  # Set replicas to at least 3",
+        })
+    }
+}
+
+func (v *Validator) checkPodDisruptionBudget(allManifests []map[string]interface{}) {
+    if v.Kind != "poddisruptionbudget" {
+        return
+    }
+
+    spec, ok := v.Manifest["spec"].(map[string]interface{})
+    if !ok {
+        return
+    }
+
+    // Check minAvailable or maxUnavailable
+    minAvailable, minOk := spec["minAvailable"].(int)
+    maxUnavailable, maxOk := spec["maxUnavailable"].(int)
+
+    if !minOk && !maxOk {
+        v.Warnings = append(v.Warnings, ValidationIssue{
+            Type:    "Warning",
+            Message: "PodDisruptionBudget must specify either minAvailable or maxUnavailable",
+            Reason:  "A PDB must define disruption limits to allow node rolls and maintenance.",
+            Fix:     "spec:\n  minAvailable: 1  # Set minAvailable or maxUnavailable",
+        })
+        return
+    }
+
+    // Ensure the PDB allows at least one disruption
+    if minOk && minAvailable >= 3 {
+        v.Warnings = append(v.Warnings, ValidationIssue{
+            Type:    "Warning",
+            Message: fmt.Sprintf("PodDisruptionBudget minAvailable %d may prevent node rolls", minAvailable),
+            Reason:  "A PDB with a high minAvailable may prevent node rolls; consider using maxUnavailable instead.",
+            Fix:     "spec:\n  maxUnavailable: 1  # Allow at least one disruption",
+        })
+    }
+
+    // Check maxUnavailable to ensure it allows at least one disruption
+    if maxOk && maxUnavailable == 0 {
+        v.Warnings = append(v.Warnings, ValidationIssue{
+            Type:    "Warning",
+            Message: fmt.Sprintf("PodDisruptionBudget maxUnavailable %d prevents node rolls", maxUnavailable),
+            Reason:  "A PDB with maxUnavailable set to 0 prevents node rolls; it should allow at least one disruption.",
+            Fix:     "spec:\n  maxUnavailable: 1  # Allow at least one disruption",
+        })
+    }
+
+    // Check for crash loop backoff (simulated via annotation for now)
+    for _, manifest := range allManifests {
+        if kind, ok := manifest["kind"].(string); ok && strings.ToLower(kind) == "pod" {
+            metadata, ok := manifest["metadata"].(map[string]interface{})
+            if !ok {
+                continue
+            }
+            annotations, ok := metadata["annotations"].(map[string]interface{})
+            if !ok {
+                continue
+            }
+            if status, ok := annotations["crash-loop-backoff"].(string); ok && status == "true" {
+                v.Warnings = append(v.Warnings, ValidationIssue{
+                    Type:    "Warning",
+                    Message: "PodDisruptionBudget should be removed for pods in crash loop backoff",
+                    Reason:  "Pods in crash loop backoff should not have a PDB to allow rescheduling.",
+                    Fix:     "# Remove the PodDisruptionBudget for this application",
+                })
+                break
+            }
+        }
+    }
+}
+
+func (v *Validator) checkDeploymentPDB(allManifests []map[string]interface{}) {
+    if v.Kind != "deployment" {
+        return
+    }
+
+    // Check if the Deployment is in crash loop backoff (simulated via annotation)
+    metadata, ok := v.Manifest["metadata"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    annotations, ok := metadata["annotations"].(map[string]interface{})
+    if !ok {
+        annotations = make(map[string]interface{})
+    }
+    if status, ok := annotations["crash-loop-backoff"].(string); ok && status == "true" {
+        // Check if a PDB exists; if so, warn to remove it
+        deploymentName, _ := metadata["name"].(string)
+        for _, manifest := range allManifests {
+            if kind, ok := manifest["kind"].(string); ok && strings.ToLower(kind) == "poddisruptionbudget" {
+                pdbMetadata, ok := manifest["metadata"].(map[string]interface{})
+                if !ok {
+                    continue
+                }
+                pdbName, _ := pdbMetadata["name"].(string)
+                if strings.Contains(pdbName, deploymentName) { // Simple name matching for now
+                    v.Warnings = append(v.Warnings, ValidationIssue{
+                        Type:    "Warning",
+                        Message: fmt.Sprintf("Deployment '%s' in crash loop backoff should not have a PodDisruptionBudget", deploymentName),
+                        Reason:  "Pods in crash loop backoff should not have a PDB to allow rescheduling.",
+                        Fix:     fmt.Sprintf("# Remove the PodDisruptionBudget for Deployment '%s'", deploymentName),
+                    })
+                    return
+                }
+            }
+        }
+        return // No PDB, which is correct for crash loop backoff
+    }
+
+    // If not in crash loop backoff, ensure a PDB exists
+    deploymentName, _ := metadata["name"].(string)
+    pdbFound := false
+    for _, manifest := range allManifests {
+        if kind, ok := manifest["kind"].(string); ok && strings.ToLower(kind) == "poddisruptionbudget" {
+            pdbMetadata, ok := manifest["metadata"].(map[string]interface{})
+            if !ok {
+                continue
+            }
+            pdbName, _ := pdbMetadata["name"].(string)
+            if strings.Contains(pdbName, deploymentName) { // Simple name matching for now
+                pdbFound = true
+                break
+            }
+        }
+    }
+
+    if !pdbFound {
+        v.Warnings = append(v.Warnings, ValidationIssue{
+            Type:    "Warning",
+            Message: fmt.Sprintf("Deployment '%s' missing a PodDisruptionBudget", deploymentName),
+            Reason:  "A PodDisruptionBudget is required to allow appropriate disruptions (e.g., node rolls) for the Deployment.",
+            Fix:     fmt.Sprintf("apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n  name: %s-pdb\nspec:\n  minAvailable: 1\n  selector:\n    matchLabels:\n      app: %s  # Adjust selector to match Deployment labels", deploymentName, deploymentName),
+        })
+    }
+}
+
+func (v *Validator) checkHPAReplicas(allManifests []map[string]interface{}) {
+    if v.Kind != "deployment" {
+        return
+    }
+
+    // Check if an HPA exists for this Deployment
+    deploymentName, _ := v.Manifest["metadata"].(map[string]interface{})["name"].(string)
+    hpaFound := false
+    for _, manifest := range allManifests {
+        if kind, ok := manifest["kind"].(string); ok && strings.ToLower(kind) == "horizontalpodautoscaler" {
+            spec, ok := manifest["spec"].(map[string]interface{})
+            if !ok {
+                continue
+            }
+            targetRef, ok := spec["scaleTargetRef"].(map[string]interface{})
+            if !ok {
+                continue
+            }
+            if targetKind, ok := targetRef["kind"].(string); ok && strings.ToLower(targetKind) == "deployment" {
+                if targetName, ok := targetRef["name"].(string); ok && targetName == deploymentName {
+                    hpaFound = true
+                    break
+                }
+            }
+        }
+    }
+
+    if !hpaFound {
+        return
+    }
+
+    // Check if replicas is specified
+    spec, ok := v.Manifest["spec"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    if _, exists := spec["replicas"]; exists {
+        v.Warnings = append(v.Warnings, ValidationIssue{
+            Type:    "Warning",
+            Message: "Deployment should not specify replicas when using an HPA",
+            Reason:  "When using an HorizontalPodAutoscaler, replicas should be managed by the HPA, not specified in the Deployment.",
+            Fix:     "spec:\n  # Remove the replicas field to allow HPA to manage scaling",
+        })
+    }
+}
+
+func (v *Validator) checkStartupProbe() {
+    if v.Kind != "deployment" && v.Kind != "pod" {
+        return
+    }
+
+    spec, ok := v.Manifest["spec"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    template, ok := spec["template"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    podSpec, ok := template["spec"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    containers, ok := podSpec["containers"].([]interface{})
+    if !ok {
+        return
+    }
+
+    for _, container := range containers {
+        cont, ok := container.(map[string]interface{})
+        if !ok {
+            continue
+        }
+        name, _ := cont["name"].(string)
+        if name == "" {
+            name = "unnamed"
+        }
+        if _, exists := cont["startupProbe"]; !exists {
+            v.Warnings = append(v.Warnings, ValidationIssue{
+                Type:    "Warning",
+                Message: fmt.Sprintf("Container '%s' missing startup probe", name),
+                Reason:  "A startup probe is recommended to ensure fast application startup, facilitating scaling, self-healing, and maintenance.",
+                Fix:     fmt.Sprintf("spec:\n  template:\n    spec:\n      containers:\n      - name: %s\n        startupProbe:\n          httpGet:\n            path: /health\n            port: 80\n          initialDelaySeconds: 5\n          periodSeconds: 5  # Add a startup probe", name),
+            })
+        }
+    }
+}
+
+func (v *Validator) checkLivenessProbeDependencies() {
+    if v.Kind != "deployment" && v.Kind != "pod" {
+        return
+    }
+
+    spec, ok := v.Manifest["spec"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    template, ok := spec["template"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    podSpec, ok := template["spec"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    containers, ok := podSpec["containers"].([]interface{})
+    if !ok {
+        return
+    }
+
+    for _, container := range containers {
+        cont, ok := container.(map[string]interface{})
+        if !ok {
+            continue
+        }
+        name, _ := cont["name"].(string)
+        if name == "" {
+            name = "unnamed"
+        }
+        livenessProbe, ok := cont["livenessProbe"].(map[string]interface{})
+        if !ok {
+            continue
+        }
+        exec, ok := livenessProbe["exec"].(map[string]interface{})
+        if !ok {
+            continue
+        }
+        command, ok := exec["command"].([]interface{})
+        if !ok {
+            continue
+        }
+        for _, cmd := range command {
+            cmdStr, ok := cmd.(string)
+            if !ok {
+                continue
+            }
+            if strings.Contains(cmdStr, "curl") || strings.Contains(cmdStr, "wget") || strings.Contains(cmdStr, "http") {
+                v.Warnings = append(v.Warnings, ValidationIssue{
+                    Type:    "Warning",
+                    Message: fmt.Sprintf("Container '%s' liveness probe may check external dependencies", name),
+                    Reason:  "Liveness probes should not check external dependencies to prevent the stampeding herd problem and reduce stress on the control plane.",
+                    Fix:     fmt.Sprintf("spec:\n  template:\n    spec:\n      containers:\n      - name: %s\n        livenessProbe:\n          httpGet:\n            path: /health\n            port: 80\n          initialDelaySeconds: 15\n          periodSeconds: 10  # Use a local health check", name),
+                })
+                break
+            }
+        }
+    }
+}
+
+func (v *Validator) checkProbeRetryRandomness() {
+    if v.Kind != "deployment" && v.Kind != "pod" {
+        return
+    }
+
+    spec, ok := v.Manifest["spec"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    template, ok := spec["template"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    podSpec, ok := template["spec"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    containers, ok := podSpec["containers"].([]interface{})
+    if !ok {
+        return
+    }
+
+    for _, container := range containers {
+        cont, ok := container.(map[string]interface{})
+        if !ok {
+            continue
+        }
+        name, _ := cont["name"].(string)
+        if name == "" {
+            name = "unnamed"
+        }
+        for _, probeType := range []string{"livenessProbe", "readinessProbe"} {
+            probe, ok := cont[probeType].(map[string]interface{})
+            if !ok {
+                continue
+            }
+            periodSeconds, ok := probe["periodSeconds"].(int)
+            if !ok {
+                continue
+            }
+            if periodSeconds > 0 && periodSeconds <= 10 {
+                v.Warnings = append(v.Warnings, ValidationIssue{
+                    Type:    "Warning",
+                    Message: fmt.Sprintf("Container '%s' %s may have fixed retry intervals", name, probeType),
+                    Reason:  "Retries in a cloud-native system should have a degree of randomness to prevent a flood of requests; consider using a random interval.",
+                    Fix:     fmt.Sprintf("spec:\n  template:\n    spec:\n      containers:\n      - name: %s\n        %s:\n          periodSeconds: 15  # Use a longer interval with randomness in application logic", name, probeType),
+                })
+            }
+        }
+    }
+}
+
+func (v *Validator) checkLongLivedConnections() {
+    if v.Kind != "deployment" && v.Kind != "pod" {
+        return
+    }
+
+    spec, ok := v.Manifest["spec"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    template, ok := spec["template"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    podSpec, ok := template["spec"].(map[string]interface{})
+    if !ok {
+        return
+    }
+    containers, ok := podSpec["containers"].([]interface{})
+    if !ok {
+        return
+    }
+
+    for _, container := range containers {
+        cont, ok := container.(map[string]interface{})
+        if !ok {
+            continue
+        }
+        name, _ := cont["name"].(string)
+        if name == "" {
+            name = "unnamed"
+        }
+        for _, probeType := range []string{"livenessProbe", "readinessProbe"} {
+            probe, ok := cont[probeType].(map[string]interface{})
+            if !ok {
+                continue
+            }
+            httpGet, ok := probe["httpGet"].(map[string]interface{})
+            if !ok {
+                continue
+            }
+            headers, ok := httpGet["httpHeaders"].([]interface{})
+            if !ok {
+                continue
+            }
+            for _, header := range headers {
+                h, ok := header.(map[string]interface{})
+                if !ok {
+                    continue
+                }
+                name, _ := h["name"].(string)
+                value, _ := h["value"].(string)
+                if strings.ToLower(name) == "connection" && strings.ToLower(value) == "keep-alive" {
+                    v.Warnings = append(v.Warnings, ValidationIssue{
+                        Type:    "Warning",
+                        Message: fmt.Sprintf("Container '%s' %s uses keep-alive, indicating potential long-lived connections", name, probeType),
+                        Reason:  "Long-lived connections between services in Kubernetes can create hotspots; consider using short-lived connections.",
+                        Fix:     fmt.Sprintf("spec:\n  template:\n    spec:\n      containers:\n      - name: %s\n        %s:\n          httpGet:\n            httpHeaders:\n            - name: Connection\n              value: close  # Use short-lived connections", name, probeType),
+                    })
+                    break
+                }
+            }
+        }
+    }
+}
+
 // Bubble Tea Model for Interactive UI
 type model struct {
     validator    *Validator
@@ -805,7 +1275,7 @@ var (
 
     reasonStyle = lipgloss.NewStyle().
         Foreground(lipgloss.Color("245")). // Light gray
-        Width(80).
+        Width(110).                       // Increased width
         Align(lipgloss.Left)
 
     fixStyle = lipgloss.NewStyle().
@@ -813,11 +1283,11 @@ var (
         Foreground(lipgloss.Color("10")).  // Green
         Padding(1).
         MarginTop(1).
-        Width(80)
+        Width(110) // Increased width
 
     progressStyle = lipgloss.NewStyle().
         Foreground(lipgloss.Color("205")). // Purple
-        Width(50)
+        Width(110)                        // Increased width
 
     navStyle = lipgloss.NewStyle().
         Foreground(lipgloss.Color("240")). // Gray
@@ -828,7 +1298,8 @@ var (
         Border(lipgloss.RoundedBorder()).
         BorderForeground(lipgloss.Color("205")). // Purple
         Padding(1).
-        Margin(1)
+        Margin(1).
+        Width(120) // Increased container width
 )
 
 func (m model) Init() tea.Cmd {
@@ -840,8 +1311,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
     case tea.KeyMsg:
         switch msg.String() {
         case "q", "ctrl+c":
-            m.quit = true
-            return m, tea.Quit
+            // Only quit if the user has seen at least one issue or there are no issues
+            if len(m.issues) == 0 || m.currentIndex > 0 {
+                m.quit = true
+                return m, tea.Quit
+            }
         case "up", "k":
             if m.currentIndex > 0 {
                 m.currentIndex--
@@ -893,23 +1367,27 @@ func (m model) View() string {
     // Progress Bar
     total := len(m.issues)
     current := m.currentIndex + 1
-    progress := progressStyle.Render(progressBar(50, current, total))
+    progress := progressStyle.Render(progressBar(110, current, total)) // Match the width
 
     // Navigation Instructions
     nav := navStyle.Render("Use ↑/↓ or k/j to navigate, q to quit.")
 
-    // Combine all parts into a container
+    // Combine all parts into a container with proper spacing
     content := lipgloss.JoinVertical(
         lipgloss.Left,
         header,
+        "", // Add a blank line for spacing
         typeMessage,
         reason,
+        "", // Add a blank line for spacing
         fix,
+        "", // Add a blank line for spacing
         progress,
+        "", // Add a blank line for spacing
         nav,
     )
 
-    return containerStyle.Render(content)
+    return containerStyle.Render(content) + "\n"
 }
 
 // progressBar generates a simple progress bar
@@ -967,29 +1445,28 @@ func validateManifest(manifestPath, manifestDir string) error {
         return fmt.Errorf("error reading manifest: %v", err)
     }
 
-    // First, unmarshal into a generic interface to determine the structure
-    var raw interface{}
-    if err := yaml.Unmarshal(data, &raw); err != nil {
-        return fmt.Errorf("error parsing manifest: %v", err)
-    }
-
-    // Convert the raw data into a slice of manifests
+    // Decode multiple YAML documents
     var manifests []map[string]interface{}
-    switch v := raw.(type) {
-    case []interface{}:
-        // If the YAML contains multiple documents (a slice), convert each to a map
-        for _, doc := range v {
-            if m, ok := doc.(map[string]interface{}); ok {
-                manifests = append(manifests, m)
+    decoder := yaml.NewDecoder(bytes.NewReader(data))
+    for {
+        var manifest map[string]interface{}
+        err := decoder.Decode(&manifest)
+        if err != nil {
+            if err == io.EOF {
+                break
             }
+            return fmt.Errorf("error parsing manifest document: %v", err)
         }
-    case map[string]interface{}:
-        // If the YAML contains a single document (a map), wrap it in a slice
-        manifests = append(manifests, v)
-    default:
-        return fmt.Errorf("error parsing manifest: unexpected YAML structure, got type %T", v)
+        if manifest != nil {
+            manifests = append(manifests, manifest)
+        }
     }
 
+    // Add the manifests from test.yaml to allManifests
+    allManifests = append(allManifests, manifests...)
+
+    // Process each manifest individually
+    var allIssues []ValidationIssue
     for _, manifest := range manifests {
         if manifest == nil {
             continue
@@ -1006,7 +1483,7 @@ func validateManifest(manifestPath, manifestDir string) error {
             Kind:     strings.ToLower(kind),
         }
 
-        // Run all validation checks
+        // Run validation checks that apply to individual manifests
         validator.checkRequiredFields()
         validator.checkNamespace()
         validator.checkLabelsAnnotations()
@@ -1017,18 +1494,44 @@ func validateManifest(manifestPath, manifestDir string) error {
         validator.checkNetworking()
         validator.checkProbes()
         validator.checkVolumes()
+        validator.checkDeploymentReplicas()
+        validator.checkPodDisruptionBudget(allManifests)
+        validator.checkHPAReplicas(allManifests)
+        validator.checkStartupProbe()
+        validator.checkLivenessProbeDependencies()
+        validator.checkProbeRetryRandomness()
+        validator.checkLongLivedConnections()
+        validator.checkDeploymentPDB(allManifests)
 
-        // Combine errors and warnings for display
-        issues := append(validator.Errors, validator.Warnings...)
-        if len(issues) == 0 {
-            issues = []ValidationIssue{}
-        }
+        // Collect issues from this manifest
+        allIssues = append(allIssues, validator.Errors...)
+        allIssues = append(allIssues, validator.Warnings...)
+    }
 
-        // Start the Bubble Tea UI
-        p := tea.NewProgram(model{validator: validator, issues: issues})
-        if _, err := p.Run(); err != nil {
-            return fmt.Errorf("error running UI: %v", err)
+    // Run cross-manifest validations (like ServiceMonitor) once after processing all manifests
+    validator := &Validator{
+        Rules: rules,
+    }
+    validator.checkServiceMonitor(allManifests)
+    allIssues = append(allIssues, validator.Errors...)
+    allIssues = append(allIssues, validator.Warnings...)
+
+    // If no issues, add a "looks good" message
+    if len(allIssues) == 0 {
+        allIssues = []ValidationIssue{
+            {
+                Type:    "Info",
+                Message: "✓ Manifest looks good!",
+                Reason:  "No validation issues were found.",
+                Fix:     "",
+            },
         }
+    }
+
+    // Start the Bubble Tea UI with all collected issues
+    p := tea.NewProgram(model{validator: validator, issues: allIssues, currentIndex: 0, quit: false})
+    if _, err := p.Run(); err != nil {
+        return fmt.Errorf("error running UI: %v", err)
     }
 
     return nil
