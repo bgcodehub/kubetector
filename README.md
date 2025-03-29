@@ -57,7 +57,7 @@ Since we’re not yet distributing a binary, you’ll need to run the tool direc
 1. **Clone the Repository**:
     
     ```bash
-    git clone <https://github.com/yourusername/kubetector.git>
+    git clone <https://github.com/bgcodehub/kubetector.git>
     cd kubetector/go
     
     ```
@@ -77,7 +77,7 @@ The tool uses several Go modules. Install them with:
 3. **Verify Setup**:
 Ensure the following files are in the `kubetector` directory:
     - `go/k8s-validator.go`: The main Go source file.
-    - `validation_rules.yaml`: The rules file (see [Customization](https://www.notion.so/1c3271f715f4801a96faf2118816ade1?pvs=21) for details).
+    - `validation_rules.yaml`: The rules file.
     - `test.yaml`: A sample Kubernetes manifest to validate (or your own manifest).
 
 ---
